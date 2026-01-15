@@ -19,8 +19,8 @@ Output layout (default):
 - Classes:    <out>/<side>-classes/<category-slug>/<ClassName>.md   (aggregates constructors/methods/properties/callbacks)
 - Functions:  <out>/<side>-functions/<category-slug>/<name>.md
 - Events:     <out>/<side>-events/<category-slug>/<name>.md
-- Globals:    <out>/<side>-globals/<category-slug>/<name>.md
-- Constants:  <out>/<side>-constants/<category-slug>/<Category>.md  (aggregated by side+category)
+- Globals:    <out>/<side>-globals/<name>.md                        (not nested by category)
+- Constants:  <out>/<side>-constants/<Category>.md                  (aggregated by side+category, not nested by category)
 
 Common failure mode fixed in this patched version:
 - If your templates are inside a "templates/" subfolder (as in templates.zip), the generator now finds them.
@@ -42,6 +42,7 @@ import argparse
 import re
 import sys
 import zipfile
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -85,14 +86,13 @@ class BlockBase:
     version: Optional[str] = None
     deprecated: Optional[str] = None
     extends: Optional[str] = None  # class.md expects definition.extends
-    declaration: str = ""  # templates expect *.declaration
     side: Side = field(default_factory=lambda: Side("unknown"))
     category: str = "Uncategorized"
     notes: List[str] = field(default_factory=list)
     params: List[Param] = field(default_factory=list)
     returns: Optional[Returns] = None
     example_code: Optional[str] = None
-    declaration: Optional[str] = None
+    declaration: str = ""  # templates expect *.declaration, always synthesized
 
     # Additional flags used by templates
     cancellable: bool = False  # event.md
@@ -255,8 +255,6 @@ def parse_block(kind: str, body: str) -> BlockBase:
 
     in_example = False
     example_acc: List[str] = []
-    in_declaration = False
-    declaration_acc: List[str] = []
 
     in_decl = False
     decl_acc: List[str] = []
@@ -324,9 +322,7 @@ def parse_block(kind: str, body: str) -> BlockBase:
         else:
             if in_example:
                 example_acc.append(line)
-            if in_declaration:
-                declaration_acc.append(line)
-            elif in_decl:
+            if in_decl:
                 decl_acc.append(line)
 
     if in_decl:
@@ -335,48 +331,38 @@ def parse_block(kind: str, body: str) -> BlockBase:
     if in_example:
         b.example_code = "\n".join(example_acc).rstrip()
 
-    if in_declaration:
-        b.declaration = "\n".join(declaration_acc).rstrip()
-
     if not b.category:
         b.category = "Uncategorized"
 
     if b.kind == "global" and b.returns is None:
         b.returns = Returns(type="void", description="")
 
-    if b.declaration is None:
-        b.declaration = ""
-
     return b
 
 
-
-def build_declaration(block_kind: str, block_name: str | None, params, returns, class_name: str | None = None) -> str | None:
+def build_declaration(block_kind: str, block_name: str | None, params, returns, class_name: str | None = None) -> str:
     """Build a declaration string.
 
     This is a *documentation* signature, not a fully accurate C++ ABI signature.
     It uses the types provided in @param/@return verbatim.
     """
-    if not block_name and block_kind not in ("constructor",):
-        return None
+    params = params or []
 
-    # Constructor uses class name
+    # Constructor uses class name; we return only the arglist, the template adds Vec4.new(...)
     if block_kind == "constructor":
-        # For class constructors, class.md template renders '<Class>.new(<args>)'.
-        # We therefore store only the argument list here.
-        args = ", ".join([f"{p.type} {p.name}".strip() for p in (params or [])])
-        return args
+        return ", ".join([f"{p.type} {p.name}".strip() for p in params])
 
     # Default return type
-    ret_type = None
+    ret_type = "void"
     if returns and getattr(returns, "type", None):
-        ret_type = returns.type.strip()
-    if not ret_type:
-        # Events/callbacks are typically void, others unknown -> void is acceptable for docs
-        ret_type = "void"
+        rt = returns.type.strip()
+        if rt:
+            ret_type = rt
 
-    args = ", ".join([f"{p.type} {p.name}".strip() for p in (params or [])])
-    return f"{ret_type} {block_name}({args})"
+    name = block_name or ""
+    args = ", ".join([f"{p.type} {p.name}".strip() for p in params])
+    return f"{ret_type} {name}({args})"
+
 
 # -----------------------------
 # Project scan + aggregation
@@ -473,6 +459,7 @@ def aggregate(
     globals_: List[BlockBase] = []
     consts_by_cat: Dict[Tuple[str, str], List[ConstElement]] = {}
 
+    # Track "current class" per file for method/property/constructor/callback assignment
     last_class_key_by_file: Dict[Path, str] = {}
 
     for file_path, b in blocks:
@@ -480,19 +467,24 @@ def aggregate(
 
         if k == "class":
             if not b.name:
+                # If class block missing @name, skip safely
                 continue
+
             key = f"{b.side.value}::{b.category}::{b.name}"
             classes_by_key[key] = ClassDoc(definition=b)
             last_class_key_by_file[file_path] = key
 
         elif k in ("constructor", "method", "property", "callback"):
+            # Assign to nearest prior class in same file
             cls_key = last_class_key_by_file.get(file_path)
             if not cls_key or cls_key not in classes_by_key:
+                # No class context; treat as global fallback so it doesn't vanish
                 b.declaration = build_declaration("global", b.name, b.params, b.returns, class_name=None)
                 globals_.append(b)
                 continue
 
             cls = classes_by_key[cls_key]
+
             if k == "constructor":
                 b.declaration = build_declaration("constructor", b.name, b.params, b.returns, class_name=cls.definition.name)
                 cls.constructors.append(b)
@@ -514,18 +506,23 @@ def aggregate(
             events.append(b)
 
         elif k in ("const", "constant"):
-            if not b.name:
-                continue
+            # Aggregate by side+category; const template expects category + elements
             cat = b.category or "Uncategorized"
             side = b.side.value
-            consts_by_cat.setdefault((side, cat), []).append(
-                ConstElement(name=b.name, description=b.description or "")
-            )
+            if not b.name:
+                continue
+            consts_by_cat.setdefault((side, cat), []).append(ConstElement(
+                name=b.name,
+                description=b.description or "",
+            ))
 
         elif k == "global":
+            b.declaration = build_declaration("global", b.name, b.params, b.returns, class_name=None)
             globals_.append(b)
 
         else:
+            # Unknown kind: treat as global so it doesn't get dropped
+            b.declaration = build_declaration("global", b.name, b.params, b.returns, class_name=None)
             globals_.append(b)
 
     return classes_by_key, functions, events, globals_, consts_by_cat
@@ -577,7 +574,6 @@ def const_out_path(out_root: Path, side: str, category: str) -> Path:
     safe_name = (category or "Uncategorized").strip() or "Uncategorized"
     # Constants are not nested by category (exception); filename is the category.
     return out_root / f"{side}-constants" / f"{safe_name}.md"
-
 
 
 def render_docs(
@@ -636,6 +632,31 @@ def render_docs(
 
 
 # -----------------------------
+# Output directory cleaning
+# -----------------------------
+
+
+def clean_output_root(out_root: Path) -> None:
+    """Delete all contents of the output root, but keep the root directory itself.
+
+    This ensures that:
+    - Removed/renamed entities disappear from docs
+    - No stale Markdown files remain between runs
+    """
+    if not out_root.exists():
+        return
+
+    for p in out_root.iterdir():
+        try:
+            if p.is_file() or p.is_symlink():
+                p.unlink()
+            elif p.is_dir():
+                shutil.rmtree(p)
+        except Exception as exc:
+            print(f"WARN: Failed to remove {p}: {exc}", file=sys.stderr)
+
+
+# -----------------------------
 # CLI
 # -----------------------------
 
@@ -684,7 +705,12 @@ def main(argv: List[str]) -> int:
 
     classes_by_key, functions, events, globals_, consts_by_cat = aggregate(blocks)
 
-    out_root.mkdir(parents=True, exist_ok=True)
+    # Clean existing docs before writing new ones
+    if out_root.exists():
+        clean_output_root(out_root)
+    else:
+        out_root.mkdir(parents=True, exist_ok=True)
+
     render_docs(out_root, env, classes_by_key, functions, events, globals_, consts_by_cat)
 
     print(f"Done. Parsed {len(blocks)} blocks.")
