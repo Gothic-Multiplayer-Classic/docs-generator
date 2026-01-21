@@ -43,12 +43,12 @@ import re
 import sys
 import zipfile
 import shutil
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
-
 
 # -----------------------------
 # Data models (match templates)
@@ -364,6 +364,41 @@ def build_declaration(block_kind: str, block_name: str | None, params, returns, 
     return f"{ret_type} {name}({args})"
 
 
+LUA_TYPE_MAP = {
+    "int": "integer",
+    "integer": "integer",
+    "long": "integer",
+
+    "float": "number",
+    "double": "number",
+    "number": "number",
+
+    "bool": "boolean",
+    "boolean": "boolean",
+
+    "string": "string",
+    "table": "table",
+    "userdata": "userdata",
+    "function": "fun",
+}
+
+def lua_type_from_doc_type(t: str) -> str:
+    """
+    Map your doc param types -> Lua LS types.
+    Falls back to the original string if unknown.
+    """
+    if not t:
+        return "any"
+    base = t.strip().lower()
+
+    # Handle things like (int) or {x, y} or custom structs
+    # Try to strip braces or surrounding junk:
+    #   "{x, y}" -> "table"
+    if base.startswith("{") and base.endswith("}"):
+        return "table"
+
+    return LUA_TYPE_MAP.get(base, base)
+
 # -----------------------------
 # Project scan + aggregation
 # -----------------------------
@@ -526,6 +561,238 @@ def aggregate(
             globals_.append(b)
 
     return classes_by_key, functions, events, globals_, consts_by_cat
+
+def build_api_model(
+    classes_by_key: Dict[str, ClassDoc],
+    functions: List[BlockBase],
+    events: List[BlockBase],
+    globals_: List[BlockBase],
+    consts_by_cat: Dict[Tuple[str, str], List[ConstElement]],
+) -> dict:
+    """
+    Build a JSON-serializable structure describing the API,
+    suitable for later conversion into Lua stub files for Lua LS.
+    """
+
+    api: dict = {
+        "classes": {},
+        "functions": [],
+        "globals": [],
+        "events": [],
+        "constants": {},
+    }
+
+    # Classes
+    for key, cls in classes_by_key.items():
+        cdef = cls.definition
+        class_name = cdef.name or "UnnamedClass"
+        cls_entry = {
+            "name": class_name,
+            "doc": cdef.description or "",
+            "side": cdef.side.value,
+            "category": cdef.category,
+            "extends": cdef.extends,
+            "fields": [],
+            "methods": [],
+            "callbacks": [],
+        }
+
+        # Properties -> fields
+        for prop in cls.properties:
+            lua_t = "any"
+            if prop.returns and prop.returns.type:
+                lua_t = lua_type_from_doc_type(prop.returns.type)
+            cls_entry["fields"].append(
+                {
+                    "name": prop.name or "",
+                    "type": lua_t,
+                    "doc": prop.description or (prop.returns.description if prop.returns else ""),
+                }
+            )
+
+        # Constructors (we treat them as overloads of <Class>.new)
+        for ctor in cls.constructors:
+            params = []
+            for p in ctor.params:
+                params.append(
+                    {
+                        "name": p.name,
+                        "type": lua_type_from_doc_type(p.type),
+                        "doc": p.description,
+                    }
+                )
+            cls_entry["methods"].append(
+                {
+                    "name": "new",
+                    "is_constructor": True,
+                    "doc": ctor.description or "",
+                    "params": params,
+                    "returns": {
+                        "type": class_name,
+                        "doc": "",
+                    },
+                }
+            )
+
+        # Methods
+        for m in cls.methods:
+            params = []
+            for p in m.params:
+                params.append(
+                    {
+                        "name": p.name,
+                        "type": lua_type_from_doc_type(p.type),
+                        "doc": p.description,
+                    }
+                )
+            ret_type = "nil"
+            ret_doc = ""
+            if m.returns:
+                ret_type = lua_type_from_doc_type(m.returns.type)
+                ret_doc = m.returns.description
+
+            cls_entry["methods"].append(
+                {
+                    "name": m.name or "",
+                    "doc": m.description or "",
+                    "params": params,
+                    "returns": {
+                        "type": ret_type,
+                        "doc": ret_doc,
+                    },
+                }
+            )
+
+        # Callbacks (events on the class)
+        for cb in cls.callbacks:
+            params = []
+            for p in cb.params:
+                params.append(
+                    {
+                        "name": p.name,
+                        "type": lua_type_from_doc_type(p.type),
+                        "doc": p.description,
+                    }
+                )
+            cls_entry["callbacks"].append(
+                {
+                    "name": cb.name or "",
+                    "doc": cb.description or "",
+                    "params": params,
+                    "cancellable": cb.cancellable,
+                }
+            )
+
+        api["classes"][class_name] = cls_entry
+
+    # Global functions (non-methods)
+    for fn in functions:
+        if not fn.name:
+            continue
+        params = []
+        for p in fn.params:
+            params.append(
+                {
+                    "name": p.name,
+                    "type": lua_type_from_doc_type(p.type),
+                    "doc": p.description,
+                }
+            )
+        ret_type = "nil"
+        ret_doc = ""
+        if fn.returns:
+            ret_type = lua_type_from_doc_type(fn.returns.type)
+            ret_doc = fn.returns.description
+
+        api["functions"].append(
+            {
+                "name": fn.name,
+                "doc": fn.description or "",
+                "side": fn.side.value,
+                "category": fn.category,
+                "params": params,
+                "returns": {
+                    "type": ret_type,
+                    "doc": ret_doc,
+                },
+            }
+        )
+
+    # Events (global events, not class callbacks)
+    for ev in events:
+        if not ev.name:
+            continue
+        params = []
+        for p in ev.params:
+            params.append(
+                {
+                    "name": p.name,
+                    "type": lua_type_from_doc_type(p.type),
+                    "doc": p.description,
+                }
+            )
+        api["events"].append(
+            {
+                "name": ev.name,
+                "doc": ev.description or "",
+                "side": ev.side.value,
+                "category": ev.category,
+                "params": params,
+                "cancellable": ev.cancellable,
+            }
+        )
+
+    # Globals
+    for g in globals_:
+        if not g.name:
+            continue
+        params = []
+        for p in g.params:
+            params.append(
+                {
+                    "name": p.name,
+                    "type": lua_type_from_doc_type(p.type),
+                    "doc": p.description,
+                }
+            )
+        ret_type = "nil"
+        ret_doc = ""
+        if g.returns:
+            ret_type = lua_type_from_doc_type(g.returns.type)
+            ret_doc = g.returns.description
+
+        api["globals"].append(
+            {
+                "name": g.name,
+                "doc": g.description or "",
+                "side": g.side.value,
+                "category": g.category,
+                "params": params,
+                "returns": {
+                    "type": ret_type,
+                    "doc": ret_doc,
+                },
+            }
+        )
+
+    # Constants grouped by side+category
+    for (side, category), elements in consts_by_cat.items():
+        api["constants"].setdefault(side, {})
+        cat_entry = api["constants"][side].setdefault(category, [])
+        for elem in elements:
+            cat_entry.append(
+                {
+                    "name": elem.name,
+                    "doc": elem.description,
+                }
+            )
+
+    return api
+
+
+def write_api_json(out_root: Path, api_model: dict) -> None:
+    path = out_root.parent / "api.json"
+    path.write_text(json.dumps(api_model, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # -----------------------------
@@ -712,6 +979,10 @@ def main(argv: List[str]) -> int:
         out_root.mkdir(parents=True, exist_ok=True)
 
     render_docs(out_root, env, classes_by_key, functions, events, globals_, consts_by_cat)
+    
+    # Build Lua API description and write api.json
+    api_model = build_api_model(classes_by_key, functions, events, globals_, consts_by_cat)
+    write_api_json(out_root, api_model)
 
     print(f"Done. Parsed {len(blocks)} blocks.")
     print(
